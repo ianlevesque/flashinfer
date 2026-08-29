@@ -405,6 +405,11 @@ def get_sparse_mla_sm120_module():
         # Contiguous-ize at this single choke point (small int copy per call).
         if not indices.is_contiguous():
             indices = indices.contiguous()
+        # Same for the dual-cache extra segment: it is typically a narrowed
+        # tail slice (indices[:, k1:]) and therefore strided; the kernel's
+        # CHECK_INPUT on extra_indices (named eidx) asserts contiguity.
+        if extra_indices is not None and not extra_indices.is_contiguous():
+            extra_indices = extra_indices.contiguous()
         module.sparse_mla_sm120_paged_attention(
             q,
             kv_cache,
