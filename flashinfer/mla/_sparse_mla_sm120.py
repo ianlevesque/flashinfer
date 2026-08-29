@@ -399,6 +399,12 @@ def get_sparse_mla_sm120_module():
                 "in _DECODE_DSV4_DISPATCH and _DECODE_DSV3_2_DISPATCH."
             )
 
+        # The CUDA kernel hard-asserts eidx.IsContiguous(); segment splits
+        # (dual-cache primary/extra narrowing in _core.py) and newer callers'
+        # packed top-k metadata legitimately produce strided index views.
+        # Contiguous-ize at this single choke point (small int copy per call).
+        if not indices.is_contiguous():
+            indices = indices.contiguous()
         module.sparse_mla_sm120_paged_attention(
             q,
             kv_cache,
