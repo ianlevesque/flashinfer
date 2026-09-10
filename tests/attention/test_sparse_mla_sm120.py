@@ -3581,3 +3581,183 @@ def test_sparse_mla_sm120_envelope_consistency(
     else:
         with pytest.raises(RuntimeError, match="sparse-MLA"):
             call()
+
+
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("mode", ["decode", "prefill", "fulltile"])
+def test_sparse_mla_sm120_dsv41_pages128_graph(num_heads: int, mode: str) -> None:
+    """CSA1 pages128 match pages64 and an SDPA oracle, including graph replay.
+
+    Repack the same logical KV rows into both page sizes. Change the queries,
+    physical row indices and valid lengths at replay, crossing page boundaries.
+    Explicit -1 tail entries honor the existing sparse-index padding contract.
+    """
+    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+
+    torch.manual_seed(41)
+    device = torch.device("cuda")
+    num_tokens = 6 if mode == "decode" else 65
+    topk, extra_topk, num_rows, dim = 128, 512, 2048, 512
+    scale = dim**-0.5
+    # Unit-scale values and page-specific signatures keep attention outputs
+    # large enough that an incorrect/zero gather cannot hide under tolerance.
+    signature = torch.linspace(-1, 1, dim, device=device)
+    page_ids = torch.arange(num_rows, device=device) // 64
+    main = (
+        torch.randn(num_rows, dim, device=device) * 0.5
+        + ((page_ids % 7).float() - 3)[:, None] * signature[None, :]
+    ).bfloat16()
+    extra = (
+        torch.randn(num_rows, dim, device=device) * 0.5
+        + ((page_ids % 11).float() - 5)[:, None] * signature[None, :]
+    ).bfloat16()
+    main_packed = quantize_kv_dsv4(main.view(-1, 64, 1, dim))
+    extras = {pbs: quantize_kv_dsv4(extra.view(-1, pbs, 1, dim)) for pbs in (64, 128)}
+    main_dequant = dequantize_kv_dsv4(main_packed).reshape(-1, dim)
+    extra_dequant = dequantize_kv_dsv4(extras[64]).reshape(-1, dim)
+    torch.testing.assert_close(
+        dequantize_kv_dsv4(extras[128]).reshape(-1, dim),
+        extra_dequant,
+        atol=0,
+        rtol=0,
+    )
+    virtual_kv = torch.cat([main_dequant, extra_dequant]).reshape(-1, 1, 1, dim)
+    sink = torch.randn(num_heads, device=device, dtype=torch.float32)
+    main_cols = torch.arange(topk, device=device)[None, :]
+    extra_cols = torch.arange(extra_topk, device=device)[None, :]
+    row_ids = torch.arange(num_tokens, device=device)
+    main_bounds = torch.tensor([0, 1, 63, 64, 65, 127, 128], device=device)
+    extra_bounds = torch.tensor(
+        [0, 1, 63, 64, 65, 127, 128, 129, 511, 512], device=device
+    )
+
+    # Allocate replay payloads and references before capture: none may alias
+    # allocations made by the captured kernel's launch machinery.
+    payloads = []
+    for step in range(4):
+        q = torch.randn(num_tokens, num_heads, dim, device=device, dtype=torch.bfloat16)
+        main_lens = main_bounds[(row_ids + step) % len(main_bounds)].int()
+        extra_lens = extra_bounds[(row_ids + step * 3) % len(extra_bounds)].int()
+        main_idx = torch.randint(
+            num_rows, (num_tokens, topk), device=device, dtype=torch.int32
+        )
+        extra_idx = torch.randint(
+            num_rows, (num_tokens, extra_topk), device=device, dtype=torch.int32
+        )
+        main_idx.masked_fill_(main_cols >= main_lens[:, None], -1)
+        extra_idx.masked_fill_(extra_cols >= extra_lens[:, None], -1)
+        shifted = torch.where(extra_idx >= 0, extra_idx + num_rows, -1)
+        ref_out, ref_lse = _ref_sparse_attn(
+            q,
+            virtual_kv,
+            torch.cat([main_idx, shifted], dim=-1),
+            scale,
+            dim,
+            attn_sink=sink,
+        )
+        payloads.append(
+            (q, main_idx, extra_idx, main_lens, extra_lens, ref_out, ref_lse)
+        )
+
+    static = [t.clone() for t in payloads[0][:5]]
+    outputs = {
+        pbs: (
+            torch.empty(
+                num_tokens, num_heads, dim, device=device, dtype=torch.bfloat16
+            ),
+            torch.empty(num_tokens, num_heads, device=device, dtype=torch.float32),
+        )
+        for pbs in extras
+    }
+    scratch = {
+        pbs: _make_decode_scratch(
+            num_tokens, num_heads, topk, dim, device, extra_topk=extra_topk
+        )
+        for pbs in extras
+    }
+
+    def run():
+        q, main_idx, extra_idx, main_lens, extra_lens = static
+        for pbs, packed in extras.items():
+            output, lse = outputs[pbs]
+            kwargs = dict(
+                attn_sink=sink,
+                extra_kv_cache=packed,
+                extra_indices=extra_idx,
+                topk_length=None if mode == "fulltile" else main_lens,
+                extra_topk_length=None if mode == "fulltile" else extra_lens,
+            )
+            if mode == "decode":
+                mid_out, mid_lse = scratch[pbs]
+                sparse_mla_sm120_decode_dsv4(
+                    q,
+                    main_packed,
+                    main_idx,
+                    mid_out,
+                    mid_lse,
+                    output,
+                    lse,
+                    scale,
+                    chunks_per_block=1,
+                    **kwargs,
+                )
+            else:
+                sparse_mla_sm120_paged_attention(
+                    q,
+                    main_packed,
+                    main_idx,
+                    output,
+                    lse,
+                    scale,
+                    d_v=dim,
+                    **kwargs,
+                )
+
+    def check(payload):
+        ref_out, ref_lse = payload[-2:]
+        for output, lse in outputs.values():
+            torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+            torch.testing.assert_close(lse, ref_lse, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(
+            outputs[128][0], outputs[64][0], atol=1e-3, rtol=1e-3
+        )
+        torch.testing.assert_close(
+            outputs[128][1], outputs[64][1], atol=1e-3, rtol=1e-3
+        )
+
+    # Eager correctness is checked separately from address-stable replay.
+    run()
+    check(payloads[0])
+    # Negative control: shuffle whole physical pages without fixing indices.
+    # This preserves the valid footer ABI while deliberately gathering wrong
+    # values. The same close assertion used for page equivalence must reject it.
+    correct = outputs[128][0].clone()
+    saved = extras[128]
+    extras[128] = saved.roll(1, dims=0)
+    run()
+    try:
+        torch.testing.assert_close(outputs[128][0], correct, atol=1e-3, rtol=1e-3)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("Wrong physical-page payload escaped the numerical check")
+    negative_max_abs = (outputs[128][0].float() - correct.float()).abs().max().item()
+    print(
+        f"pages128 negative control {mode=} {num_heads=}: max_abs={negative_max_abs:.6g}"
+    )
+    extras[128] = saved
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for payload in payloads[1:]:
+        for dst, src in zip(static, payload[:5], strict=True):
+            dst.copy_(src)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(payload)
