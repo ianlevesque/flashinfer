@@ -3583,14 +3583,39 @@ def test_sparse_mla_sm120_envelope_consistency(
             call()
 
 
+def _roundtrip_dsv4_decode_query(q: torch.Tensor) -> torch.Tensor:
+    """Match decode's per-64 NoPE E4M3/UE8M0 quantization; RoPE stays BF16.
+
+    See quantize_q_to_smem in common/fp8_quant.cuh. Dual-cache prefill uses
+    ComputeMode::BF16 instead, so its reference must use the original query.
+    """
+    blocks = q[..., :448].float().reshape(*q.shape[:-1], 7, 64)
+    scales = torch.exp2(
+        (blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448).log2().ceil()
+    )
+    rounded = (blocks / scales).clamp(-448, 448).to(
+        torch.float8_e4m3fn
+    ).float() * scales
+    result = q.float().clone()
+    result[..., :448] = rounded.flatten(-2)
+    return result
+
+
 @pytest.mark.parametrize("num_heads", [8, 16])
-@pytest.mark.parametrize("mode", ["decode", "prefill", "fulltile"])
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
 def test_sparse_mla_sm120_dsv41_pages128_graph(num_heads: int, mode: str) -> None:
     """CSA1 pages128 match pages64 and an SDPA oracle, including graph replay.
 
     Repack the same logical KV rows into both page sizes. Change the queries,
     physical row indices and valid lengths at replay, crossing page boundaries.
     Explicit -1 tail entries honor the existing sparse-index padding contract.
+
+    V4.1's SM120 adapter supplies SWA and extra lengths and discards LSE:
+    flashinfer/mla/_core.py::_trtllm_batch_decode_sparse_mla_dsv4_sm120 requires
+    swa_topk_lens, pairs extra indices with lengths, and sets return_lse=False.
+    Therefore V4.1 cannot select the fulltile dispatcher, which requires both
+    length pointers null. This test qualifies its length-aware production path;
+    the separate fulltile all-masked sink-LSE overflow is outside this change.
     """
     from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
 
@@ -3647,8 +3672,9 @@ def test_sparse_mla_sm120_dsv41_pages128_graph(num_heads: int, mode: str) -> Non
         main_idx.masked_fill_(main_cols >= main_lens[:, None], -1)
         extra_idx.masked_fill_(extra_cols >= extra_lens[:, None], -1)
         shifted = torch.where(extra_idx >= 0, extra_idx + num_rows, -1)
+        reference_q = _roundtrip_dsv4_decode_query(q) if mode == "decode" else q
         ref_out, ref_lse = _ref_sparse_attn(
-            q,
+            reference_q,
             virtual_kv,
             torch.cat([main_idx, shifted], dim=-1),
             scale,
@@ -3684,8 +3710,8 @@ def test_sparse_mla_sm120_dsv41_pages128_graph(num_heads: int, mode: str) -> Non
                 attn_sink=sink,
                 extra_kv_cache=packed,
                 extra_indices=extra_idx,
-                topk_length=None if mode == "fulltile" else main_lens,
-                extra_topk_length=None if mode == "fulltile" else extra_lens,
+                topk_length=main_lens,
+                extra_topk_length=extra_lens,
             )
             if mode == "decode":
                 mid_out, mid_lse = scratch[pbs]
@@ -3715,15 +3741,30 @@ def test_sparse_mla_sm120_dsv41_pages128_graph(num_heads: int, mode: str) -> Non
 
     def check(payload):
         ref_out, ref_lse = payload[-2:]
-        for output, lse in outputs.values():
-            torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
-            torch.testing.assert_close(lse, ref_lse, atol=5e-2, rtol=5e-2)
+        # Report page-address equivalence before the independent SDPA oracle.
+        page_out_error = (outputs[128][0].float() - outputs[64][0].float()).abs()
+        page_lse_error = (outputs[128][1] - outputs[64][1]).abs()
+        print(
+            f"pages128 parity {mode=} {num_heads=}: "
+            f"output_max_abs={page_out_error.max().item():.6g} "
+            f"lse_max_abs={page_lse_error.max().item():.6g}"
+        )
         torch.testing.assert_close(
             outputs[128][0], outputs[64][0], atol=1e-3, rtol=1e-3
         )
         torch.testing.assert_close(
             outputs[128][1], outputs[64][1], atol=1e-3, rtol=1e-3
         )
+        for pbs, (output, lse) in outputs.items():
+            out_error = (output.float() - ref_out.float()).abs()
+            lse_error = (lse - ref_lse).abs()
+            print(
+                f"pages128 oracle {mode=} {num_heads=} {pbs=}: "
+                f"output_max_abs={out_error.max().item():.6g} "
+                f"lse_max_abs={lse_error.max().item():.6g}"
+            )
+            torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+            torch.testing.assert_close(lse, ref_lse, atol=5e-2, rtol=5e-2)
 
     # Eager correctness is checked separately from address-stable replay.
     run()
