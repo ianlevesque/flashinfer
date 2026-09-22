@@ -741,6 +741,18 @@ def get_sparse_mla_sm120_module():
             )
             return
 
+        # The prefill kernel asserts dense row-major indices
+        # (CHECK_INPUT_AND_TYPE + check_dense_indices_2d_or_s_q_3d in
+        # csrc/sparse_mla_sm120.cu), but dual-cache segment narrowing and
+        # packed top-k metadata callers produce strided views (vLLM DSV4 TP16
+        # on GB10 crashed every rank). The stride-aware decode entries above
+        # need no guard, so contiguous-ize here, at the paged/prefill choke
+        # point only. Port of 25924033 + 5aa0c4cc (0.6.18 era); #4802 rewrote
+        # this module and moved the call site.
+        if not indices.is_contiguous():
+            indices = indices.contiguous()
+        if extra_indices is not None and not extra_indices.is_contiguous():
+            extra_indices = extra_indices.contiguous()
         module.sparse_mla_sm120_paged_attention(
             q,
             kv_cache,
