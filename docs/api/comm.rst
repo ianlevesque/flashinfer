@@ -38,23 +38,31 @@ All-Gather Matmul
 
 ``all_gather_matmul`` keeps its architecture-based default routing when
 ``backend="auto"``. On SM100 and SM103, ``backend="cake"`` explicitly selects
-the source-built fused backend for contiguous bfloat16 or float16 inputs with
-``K=8192``, ``N=2048``, a positive ``M`` divisible by 128, an NVSHMEM symmetric
-memory backend, and a two- or four-rank NCCL process group. The local input may
-be an ordinary contiguous CUDA tensor because Cake uses internal symmetric
-scratch and flags for remote access and synchronization. Unsupported explicit
-Cake requests raise instead of silently falling back.
-The packaged manifest carries the exact dynamic shared-memory requirement
-resolved for every generated main route; the loader validates that value
-against the packaged CUDA source before compiling the host launcher.
+the Cake fused backend for bfloat16 or float16 operands with ``K=8192``: a
+contiguous ``[M, 8192]`` input with any positive ``M``, a ``[8192, N]`` weight
+with ``N`` a positive multiple of 256 that is either contiguous or the
+transposed view of a contiguous ``[N, 8192]`` parameter (each layout has its
+own generated kernel; no copy is made), the process's torch symmetric-memory
+backend being the default ``CUDA`` backend or ``NVSHMEM`` (the Cake backend
+never selects one itself), and a two-, four- or eight-rank NCCL process group.
+The local input may be an ordinary contiguous CUDA tensor because Cake uses
+internal symmetric scratch and flags for remote access and synchronization;
+the scratch of a group grows to the largest ``M`` seen, and that growth is the
+only collective after the first call. Unsupported explicit Cake requests raise
+instead of silently falling back. One generated source per kernel serves both
+architectures; the JIT loader compiles it with the exact flag set of the
+device it runs on.
 
-``prepare_all_gather_matmul`` prepares the source-built packed-QKV route for
-SM103, bfloat16, four-rank NCCL groups, contiguous ``[M, 8192]`` inputs, and a
-contiguous ``[8192, 2560]`` weight, where ``M`` is a positive multiple of 128.
-It binds the weight and process group once and returns a callable that accepts
-a contiguous input with the same shape, dtype, and device. Both
-``backend="auto"`` and ``backend="cake"`` select this prepared route.
-Unsupported configurations raise during preparation instead of falling back.
+``prepare_all_gather_matmul`` binds the weight, the process group and a row
+capacity ``max_rows`` (default: the rows of the sample input) once, sizing the
+symmetric scratch in that single collective, and returns a callable that
+accepts any contiguous input with the same dtype, device and ``K`` and at
+most ``max_rows`` rows. Both ``backend="auto"`` and ``backend="cake"`` select
+this prepared Cake route; the same operand rules as the one-shot Cake route
+apply. The returned launcher is CUDA-graph capturable: a captured call
+allocates nothing but its output, and a call that would need a larger scratch
+raises inside capture instead of running a collective. Unsupported
+configurations raise during preparation instead of falling back.
 
 .. autosummary::
     :toctree: ../generated
@@ -210,14 +218,114 @@ shape, dtype or call order hang rather than raise. One workspace serves one
 CUDA stream; use :meth:`~PcieIpcAllReduceWorkspace.rebind_stream` after
 ordering the two if a move is genuinely needed.
 
+Two data planes
+~~~~~~~~~~~~~~~
+
+Above roughly a megabyte the workspace can move the payload with the copy
+engines instead of with SM load/store. The reason is not that the copy engine
+is faster per hop — in isolation the two are comparable — but that it keeps
+its throughput when every rank transfers at once, where SM peer traffic loses
+bandwidth to the concurrency. So the gap widens with world size, which is what
+makes a second plane worth having at these payload sizes.
+
+It is a second protocol rather than a flag on the existing kernels. The SM path
+encodes readiness in the payload — ``+0.0`` means "not yet written" — which a
+copy engine can neither produce nor observe, so the ring synchronises through
+monotonic flags on side streams instead. Nothing about the SM kernels changes.
+
+Both planes are ordinary tuner candidates, so nothing needs to be declared at
+the call site and there is no notion of a prefill or decode "phase": the
+configuration follows the payload in bytes.
+:class:`PcieIpcVariant` gains ``COPY_ENGINE_RING``, a flat neighbour ring, and
+``COPY_ENGINE_ISLAND``, a 4+4 decomposition offered only at world size 8 and
+only on ``rootcplx-noswitch``, where a ring's two socket-crossing hops would
+otherwise set the pace. On that variant ``blocks`` carries the ring's sub-chunk
+depth rather than a grid size.
+
+.. warning::
+
+    Tuning covers the batch sizes it is given, and shapes above the largest one
+    are served by whatever was measured there. Leave ``tune_batches`` unset and
+    the ladder is derived from ``max_numel``, which covers everything the
+    workspace admits; pass it explicitly and the top of the range is yours to
+    get right. :meth:`~PcieIpcAllReduceWorkspace.tune` warns when an explicit
+    list leaves a gap, and refuses to persist results measured below the
+    default sample counts, since a table that is quietly wrong is worse than
+    one that is missing.
+
 .. autosummary::
     :toctree: ../generated
 
     PcieIpcAllReduceWorkspace
     PcieIpcLaunchConfig
+    PcieIpcVariant
     get_pcie_ipc_launch_config
     probe_pcie_ipc_rank_topology
     resolve_pcie_ipc_profile
+
+PCIe IPC AllGather and ReduceScatter
+------------------------------------
+
+These standalone workspaces support BF16, FP16, and FP32 tensors at world sizes
+2, 4, and 8. ``max_numel`` sizes one rank's shard: the AllGather input or the
+ReduceScatter output. Tensors must be contiguous, rank-2, 16-byte aligned, and
+contain complete 16-byte packs.
+
+Their Python implementation lives in ``flashinfer.comm.pcie_ipc_collectives``;
+the public entry points remain the ``flashinfer.comm`` exports shown below.
+
+As with :class:`PcieIpcAllReduceWorkspace`, construction, calls, and destruction
+are collective. Every rank must issue the same sequence and configuration, and
+one workspace belongs to one ordered CUDA stream. Keep the workspace alive
+until every captured CUDA graph replay has completed.
+
+AllGather copies opaque 16-byte packs. ReduceScatter accumulates in FP32 and
+converts to the requested output dtype; its TP8 schedule converts one four-rank
+partial before the final accumulation, so bitwise agreement with NCCL is not
+part of the contract.
+
+The TP8 CopyEngine AllGather and topology ReduceScatter schedules require live
+UUID/NVML evidence that logical ranks ``0..3`` and ``4..7`` form the expected
+two-island placement. AllGather falls back to recursive doubling when that
+proof is unavailable; TP8 ReduceScatter reports the input as unsupported.
+
+.. code-block:: python
+
+    import flashinfer.comm as comm
+
+    ag = comm.PcieIpcAllGatherWorkspace(group, max_local_rows * hidden, dtype=x.dtype)
+    rs = comm.PcieIpcReduceScatterWorkspace(group, max_local_rows * hidden, dtype=x.dtype)
+
+    gathered = ag.all_gather(x)            # [world_size * local_rows, hidden]
+    shard = rs.reduce_scatter(reduced_input)  # [local_rows, hidden]
+
+    ag.destroy()
+    rs.destroy()
+
+``launch_config()`` returns a conservative seed. ``tune([hidden, ...])`` checks
+every candidate against NCCL, minimizes the maximum latency across ranks, and
+persists exact-shape results. The cache key includes the collective, world size,
+topology/rank-placement fingerprint, workspace limits, dtype, and shape.
+
+The seed thresholds are heuristics; support does not imply a performance win.
+The variant names combine communication schedule, transport, and batching:
+``COPY_ENGINE`` uses recursive doubling, and ``ONE_PACK`` means one 16-byte
+pack per thread in a grid-sized batch. See
+:doc:`PCIe IPC AG/RS schedules <../design_docs/pcie_ipc_ag_rs>` for the seven
+variants, synchronization/traffic models, topology boundary, and measurement
+provenance.
+
+.. autosummary::
+    :toctree: ../generated
+
+    PcieIpcAllGatherWorkspace
+    PcieIpcAllGatherLaunchConfig
+    PcieIpcAllGatherVariant
+    get_pcie_ipc_all_gather_launch_config
+    PcieIpcReduceScatterWorkspace
+    PcieIpcReduceScatterLaunchConfig
+    PcieIpcReduceScatterVariant
+    get_pcie_ipc_reduce_scatter_launch_config
 
 Ulysses Context-Parallel All-to-All
 -----------------------------------
@@ -287,6 +395,14 @@ run on the current CUDA stream; all ranks must issue the same call sequence
 with consistent shapes, one collective in flight per communicator at a
 time.
 
+**Destination-passing and workspace mode.** Both collectives accept an
+optional preallocated ``out=`` tensor. The NCCL backend additionally accepts
+a reusable :class:`UlyssesWorkspace`, which owns the packed send and receive
+buffers and removes their per-call allocations. Omitting both keywords keeps
+the original allocation path unchanged. The NVLink backend uses ``out=`` but
+does not consume the workspace because its IPC staging allocation is owned by
+the communicator.
+
 **Known limitations.**
 
 - PyTorch builds without ``torch.cuda.get_device_properties(...).uuid``
@@ -316,7 +432,111 @@ for the full integration)::
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
 
+Preallocated outputs and NCCL staging can be reused across serialized calls::
+
+    workspace = comm.create_workspace()
+    q_global = torch.empty(B, S_global, H_local, D,
+                           dtype=q.dtype, device=q.device)
+    comm.scatter_heads(q, out=q_global, workspace=workspace)
+
 .. autoclass:: UlyssesCommunicator
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+.. autoclass:: UlyssesWorkspace
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+Head-Chunk Layout and Transport Primitives
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Head-chunk APIs are opt-in building blocks for framework-owned
+communication/compute pipelines. They do not choose a chunk schedule, create
+streams/events or process groups, or alter the ordinary ``scatter_heads`` /
+``gather_heads`` path.
+
+``pack_ulysses_qkv_head_chunk`` accepts independent positive-strided Q/K/V
+views, selects the same destination-local head band from every Ulysses rank's
+head slice, and fuses Q/K/V into the last dimension. The communicator's
+``scatter_qkv_head_chunk`` method combines that transform with one all-to-all.
+After attention, ``gather_output_head_chunk`` performs the reverse all-to-all
+and writes the compact band directly into the full output. A framework that
+overlaps the two communication directions must use separate communicators and
+workspaces::
+
+    schedule = ((0, 3), (3, 8), (11, 3))  # local_heads == 14
+    full_output = torch.empty_like(q)
+    for head_offset, head_count in schedule:
+        qkv = input_comm.scatter_qkv_head_chunk(
+            q, k, v,
+            head_offset=head_offset,
+            head_count=head_count,
+            out=qkv_chunk_buffers[head_count],
+            workspace=input_workspace,
+        )
+        q_chunk, k_chunk, v_chunk = qkv.split(head_dim, dim=-1)
+        o_chunk = attention(q_chunk, k_chunk, v_chunk)
+        output_comm.gather_output_head_chunk(
+            o_chunk,
+            local_heads=14,
+            head_offset=head_offset,
+            out=full_output,
+            workspace=output_workspace,
+        )
+
+Head chunking is not automatically profitable. In particular, tensor
+parallelism reduces the effective local head count to approximately
+``H / (TP * Ulysses)``. Frameworks should enable a schedule only after all
+ranks agree that the attention backend supports every chunk head count and an
+offline benchmark shows a positive result. Small local-head counts, GQA/MLA
+with unequal Q/K/V heads, Ring Attention, and Attention2D should use the
+ordinary path unless separately implemented and measured.
+
+.. autofunction:: pack_ulysses_qkv_head_chunk
+
+.. autofunction:: merge_ulysses_output_head_chunk
+
+Fused QKV Projection + Norm + RoPE + Head Exchange
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:class:`QkvNormRopeExchangeOverlap` fuses the attention front end of a
+sequence-parallel (Ulysses) layer into one prepared session: the BF16 QKV
+projection, per-head RMSNorm of Q and K (one ``[D]`` scale each), interleaved
+RoPE from a per-token ``[rows, D]`` cos/sin table, and the head exchange.  The
+Cake backend (``backend="nvlink"``; SM90, SM100 and SM103, single-node NVLink
+groups of 2, 4 or 8 ranks, ``head_dim=128``, BF16) stores every destination's
+head band straight from the GEMM epilogue into that rank's symmetric receive
+slot and publishes per-chunk readiness words, so the exchange overlaps the
+projection instead of following it; a one-CTA wait kernel on a consumer stream
+acquires the words and the caller's stream joins it.  The outputs are views of
+the current receive slot (``layout="bshd"``: ``(q, k, v)`` each
+``[B, S_global, H_local, D]``; ``layout="fused"``: one
+``[B, S_global, H_local, 3 * D]`` payload) and stay valid until the slot is
+reused ``num_slots`` calls later; pass ``out=`` for an owned copy.
+
+The session is prepared eagerly (symmetric slots, readiness pad, barrier
+flags, JIT programs, the tile plan of ``max_tokens`` rows) and a prepared call
+is CUDA-graph capturable: a captured call allocates nothing, runs no
+collective, publishes a sentinel epoch and clears its readiness words with a
+stream memset after the wait kernel, and replays interleave with eager calls.
+A call with more rows than ``max_tokens``, or with a row count first seen
+inside a capture, raises instead of allocating.  ``backend="auto"`` selects
+the Cake path when :func:`resolve_ulysses_backend` verifies the NVLink mesh and
+the device is a supported architecture, and otherwise the NCCL path (cuBLAS
+projection, :func:`flashinfer.norm.rmsnorm`, RoPE, then
+:meth:`UlyssesCommunicator.scatter_qkv_head_chunk`), which is not graph
+capturable (``graph_capturable`` reports ``False``).
+
+.. autosummary::
+    :toctree: ../generated
+
+    QkvNormRopeExchangeOverlap
+
+.. autoclass:: QkvNormRopeExchangeOverlap
     :members:
     :show-inheritance:
 
@@ -383,6 +603,13 @@ TensorRT-LLM MNNVL AllReduce
 MNNVL A2A (Throughput Backend)
 -------------------------------
 
+These are the kernel-level primitives of the NVLink one-sided MoE all-to-all.
+``MoeAlltoAll`` is deprecated in favor of
+:class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll` (and
+:class:`flashinfer.moe_ep.CakeAlltoAll` for ``backend="cake"``),
+which expose the dispatch/combine interface shared by all expert-parallel
+communication backends; its implementation will move into those classes.
+
 .. currentmodule:: flashinfer.comm
 
 .. autosummary::
@@ -437,6 +664,61 @@ DCP All-to-All (Context-Parallel Attention Reduction)
     decode_cp_a2a_allocate_mnnvl_workspace
     decode_cp_a2a_init_workspace
     decode_cp_a2a_alltoall
+
+NCCL LSA DCP All-to-All + LSE Reduce
+-------------------------------------
+
+The fused path uses PyTorch NCCL symmetric memory and requires every context-
+parallel rank to be in one load/store-accessible NVLink domain. It does not use
+the MNNVL workspace accepted by ``decode_cp_a2a_alltoall``.
+
+.. autosummary::
+    :toctree: ../generated
+
+    decode_cp_a2a_lse_reduce_workspace_size
+    decode_cp_a2a_lse_reduce_create_workspace
+    decode_cp_a2a_lse_reduce
+
+TP MoE Finalize + RMSNorm
+-------------------------
+
+Tensor-parallel MoE finalize fused with the all-reduce and per-expert RMSNorm,
+over an NVLink multicast workspace (hidden size 4096, top-k 8). Initialize the
+process-wide workspace collectively with ``init_tp_moe_finalize_rmsnorm`` before
+the first call.
+
+.. currentmodule:: flashinfer.comm
+
+.. autosummary::
+    :toctree: ../generated
+
+    init_tp_moe_finalize_rmsnorm
+    supports_tp_moe_finalize_rmsnorm
+    tp_moe_finalize_rmsnorm
+
+MNNVL CuTe DSL Fused Collectives
+--------------------------------
+
+.. currentmodule:: flashinfer.comm.mnnvl_cutedsl_moe_finalize
+
+.. autosummary::
+    :toctree: ../generated
+
+    MNNVLCuteDSLMoEFinalizeAllReduceWorkspace
+    supports_moe_finalize_rmsnorm_allreduce
+    moe_finalize_rmsnorm_allreduce
+
+.. currentmodule:: flashinfer.comm.mnnvl_cutedsl_ag
+
+.. autosummary::
+    :toctree: ../generated
+
+    MNNVLCuteDSLAllGatherDualNormWorkspace
+    supports_all_gather_gated_residual_next_rmsnorm
+    all_gather_gated_residual_next_rmsnorm
+    MNNVLCuteDSLAllGatherNormQuantWorkspace
+    supports_all_gather_rmsnorm_fp4_quantize
+    all_gather_rmsnorm_fp4_quantize
 
 Mixed Communication
 -------------------
